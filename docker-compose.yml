@@ -1,0 +1,24 @@
+version: '3.8'
+
+# Standalone docker-compose fuer lokale Tests.
+# In Projekten wird dieser Service per Referenz eingebunden.
+
+services:
+  timbervision-ml:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: timbervision-ml
+    restart: unless-stopped
+    ports:
+      - "8300:8300"
+    volumes:
+      # Gemeinsames Modell-Verzeichnis - alle Projekte teilen sich das Modell
+      - ~/.timbervision/models:/app/models
+      - ~/.timbervision/exports:/app/exports
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8300/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
