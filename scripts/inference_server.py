@@ -29,14 +29,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Modell-Pfad: TimberVision trainiert → Pre-trained → Legacy Fallback
 _MODELS_DIR = Path(__file__).parent.parent / 'models'
 _MODEL_CANDIDATES = [
     _MODELS_DIR / 'timbervision_yolov8' / 'weights' / 'best.pt',
     _MODELS_DIR / 'yolov8l-1024-seg.pt',
     _MODELS_DIR / 'timberseg_yolov8n' / 'weights' / 'best.pt',
 ]
-MODEL_PATH = str(next((p for p in _MODEL_CANDIDATES if p.exists()), _MODEL_CANDIDATES[0]))
+
+
+def get_model_path() -> str:
+    """Modell-Pfad dynamisch ermitteln — erkennt neu hinzugefuegte Modelle ohne Neustart."""
+    found = next((p for p in _MODEL_CANDIDATES if p.exists()), None)
+    return str(found) if found else str(_MODEL_CANDIDATES[0])
+
+
+MODEL_PATH = get_model_path()
 
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 ALLOWED_CONTENT_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
@@ -103,7 +110,7 @@ async def estimate_volume(
 
         ergebnis = inference_and_calculate(
             tmp_path,
-            model_path=MODEL_PATH,
+            model_path=get_model_path(),
             referenz_typ=referenz_typ,
             holzart=holzart,
             stamm_laenge_cm=stamm_laenge_cm,
@@ -134,11 +141,12 @@ async def get_holzarten():
 
 @app.get("/health")
 async def health():
-    """Health Check - prueft ob Modell geladen ist"""
-    model_exists = Path(MODEL_PATH).exists()
+    """Health Check - prueft ob Modell vorhanden ist (dynamisch, kein Neustart noetig)"""
+    model_path = get_model_path()
+    model_exists = Path(model_path).exists()
     return {
         "status": "ok" if model_exists else "model_missing",
-        "model_path": MODEL_PATH,
+        "model_path": model_path,
         "model_exists": model_exists,
     }
 

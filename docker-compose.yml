@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Standalone docker-compose fuer lokale Tests.
 # In Projekten wird dieser Service per Referenz eingebunden.
 
