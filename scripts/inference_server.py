@@ -55,6 +55,8 @@ async def estimate_volume(
     referenz_typ: str = Form(default='standard_lkw'),
     holzart: str = Form(default='fichte_rundholz'),
     stamm_laenge_cm: float = Form(default=None),
+    kalibrierung_pixel: float = Form(default=None),
+    kalibrierung_cm: float = Form(default=None),
 ):
     """
     Schaetze Holzvolumen aus einem Foto.
@@ -63,6 +65,11 @@ async def estimate_volume(
     - **referenz_typ**: LKW-Typ fuer Kalibrierung (standard_lkw, kurzholz_lkw, langholz_lkw, traktor_anhaenger)
     - **holzart**: Holzart fuer Umrechnungsfaktor (fichte_rundholz, buche_rundholz, etc.)
     - **stamm_laenge_cm**: Bekannte Stammlaenge in cm (optional)
+    - **kalibrierung_pixel**: Gemessene Pixel-Laenge eines Referenzobjekts im Bild
+      (z.B. Rungenhoehe in Pixeln, ausgelesen aus User-Markierung im Frontend)
+    - **kalibrierung_cm**: Echte Laenge des Referenzobjekts in cm
+      (z.B. 240 fuer Standard-LKW-Rungenhoehe). Zusammen mit kalibrierung_pixel
+      liefert das den praezisesten Pixel-zu-cm Faktor.
     """
     if referenz_typ not in LKW_REFERENZEN:
         raise HTTPException(
@@ -78,6 +85,21 @@ async def estimate_volume(
         raise HTTPException(
             status_code=422,
             detail=f"stamm_laenge_cm muss zwischen 1 und 3000 cm liegen"
+        )
+    if (kalibrierung_pixel is None) != (kalibrierung_cm is None):
+        raise HTTPException(
+            status_code=422,
+            detail="kalibrierung_pixel und kalibrierung_cm muessen gemeinsam gesetzt sein"
+        )
+    if kalibrierung_pixel is not None and (kalibrierung_pixel <= 0 or kalibrierung_pixel > 20000):
+        raise HTTPException(
+            status_code=422,
+            detail="kalibrierung_pixel muss zwischen 1 und 20000 liegen"
+        )
+    if kalibrierung_cm is not None and (kalibrierung_cm <= 0 or kalibrierung_cm > 2000):
+        raise HTTPException(
+            status_code=422,
+            detail="kalibrierung_cm muss zwischen 1 und 2000 cm liegen"
         )
 
     content_type = image.content_type or ''
@@ -114,6 +136,8 @@ async def estimate_volume(
             referenz_typ=referenz_typ,
             holzart=holzart,
             stamm_laenge_cm=stamm_laenge_cm,
+            kalibrierung_pixel=kalibrierung_pixel,
+            kalibrierung_cm=kalibrierung_cm,
         )
         return ergebnis.to_dict()
     except ValueError as exc:

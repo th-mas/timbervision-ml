@@ -67,6 +67,19 @@ class StammErgebnis:
     quelle: str = "bbox"  # "cut_ellipse", "cut_bbox", "bbox" - wie Durchmesser ermittelt
 
 
+def _py(v):
+    """Rekursive Konvertierung numpy-Typen → Python-native Typen fuer JSON-Serialisierung."""
+    if isinstance(v, np.generic):
+        return v.item()
+    if isinstance(v, np.ndarray):
+        return [_py(x) for x in v.tolist()]
+    if isinstance(v, dict):
+        return {k: _py(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_py(x) for x in v]
+    return v
+
+
 @dataclass
 class VolumenErgebnis:
     """Gesamt-Ergebnis der Volumenschaetzung"""
@@ -85,27 +98,50 @@ class VolumenErgebnis:
     })
 
     def to_dict(self):
-        return asdict(self)
+        return _py(asdict(self))
 
     def to_json(self):
         return json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
 
 
-def fit_ellipse_to_mask(mask_data, bbox_xyxy):
+def fit_ellipse_to_mask(mask_data, bbox_xyxy, img_width=None, img_height=None):
     """
     Fitte eine Ellipse an die Segmentierungsmaske.
-    Gibt (minor_axis, major_axis) in Pixeln zurueck oder None.
+    Gibt (minor_axis, major_axis) in Original-Bild-Pixeln zurueck oder None.
 
     Die Schnittflaeche ist naherungsweise elliptisch.
-    Der Minor-Axis ist der Stamm-Durchmesser (bei schraegemSchnitt).
+    Der Minor-Axis ist der Stamm-Durchmesser (bei schraegem Schnitt).
+
+    YOLOv8-Masken sind oft auf Modell-Raum (z.B. 640x640) skaliert.
+    bbox_xyxy ist aber im Original-Bildraum. Daher skalieren wir die bbox
+    auf Masken-Raum und die zurueckgegebenen Achsen wieder auf Original-Raum.
     """
     try:
         import cv2
     except ImportError:
         return None
 
-    x1, y1, x2, y2 = [int(v) for v in bbox_xyxy]
-    # Maske auf BBox zuschneiden
+    mask_h, mask_w = mask_data.shape[:2]
+
+    # Skalierungsfaktoren Maske -> Original (fuer Rueckgabe) bzw. Original -> Maske (fuer Crop)
+    if img_width and img_height and img_width > 0 and img_height > 0:
+        scale_to_mask_x = mask_w / img_width
+        scale_to_mask_y = mask_h / img_height
+        scale_to_orig_x = img_width / mask_w
+        scale_to_orig_y = img_height / mask_h
+    else:
+        scale_to_mask_x = scale_to_mask_y = 1.0
+        scale_to_orig_x = scale_to_orig_y = 1.0
+
+    x1 = max(0, int(bbox_xyxy[0] * scale_to_mask_x))
+    y1 = max(0, int(bbox_xyxy[1] * scale_to_mask_y))
+    x2 = min(mask_w, int(bbox_xyxy[2] * scale_to_mask_x))
+    y2 = min(mask_h, int(bbox_xyxy[3] * scale_to_mask_y))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    # Maske auf (skalierte) BBox zuschneiden
     crop = mask_data[y1:y2, x1:x2]
     if crop.size == 0:
         return None
@@ -125,14 +161,19 @@ def fit_ellipse_to_mask(mask_data, bbox_xyxy):
         return None
 
     ellipse = cv2.fitEllipse(largest)
-    # ellipse = ((cx, cy), (width, height), angle)
+    # ellipse = ((cx, cy), (width, height), angle) - im Masken-Raum
     width, height = ellipse[1]
 
     if width <= 0 or height <= 0:
         return None
 
-    minor = min(width, height)
-    major = max(width, height)
+    # Zurueckskalieren in Original-Bild-Pixel
+    # (Achsen-Laengen werden nicht richtungs-spezifisch skaliert, daher nehmen wir
+    # den Durchschnitt von X und Y Scale-Faktoren, was bei gleichmaessiger
+    # Skalierung korrekt und sonst eine brauchbare Naeherung ist)
+    avg_scale = (scale_to_orig_x + scale_to_orig_y) / 2
+    minor = min(width, height) * avg_scale
+    major = max(width, height) * avg_scale
     return minor, major
 
 
@@ -144,10 +185,21 @@ class VolumeCalculator:
         self.holzart = holzart
         self.umrechnungsfaktor = UMRECHNUNGSFAKTOREN.get(holzart, 0.65)
 
-    def berechne_px_pro_cm(self, img_width, img_height, referenz_breite_px=None):
+    def berechne_px_pro_cm(self, img_width, img_height, referenz_breite_px=None,
+                            kalibrierung_pixel=None, kalibrierung_cm=None):
         """
-        Berechne Pixel-zu-cm Faktor anhand bekannter LKW-Masse.
+        Berechne Pixel-zu-cm Faktor.
+
+        Priorisierung (von praeziseste zu ungenauste):
+          1. kalibrierung_pixel + kalibrierung_cm: direkte Messung
+             (z.B. Rungenhoehe: User misst Rungen im Bild = 480px, Rungen sind 240cm → px/cm = 2.0)
+          2. referenz_breite_px: bekannte LKW-Breite in Pixeln (User-Input)
+          3. Fallback: Schaetzung aus Bildbreite * 0.80 / LKW-Breite (ungenau)
         """
+        # Methode 1: direkte Kalibrierung ueber bekanntes Referenzobjekt (z.B. Runge, Messlatte)
+        if kalibrierung_pixel and kalibrierung_cm and kalibrierung_pixel > 0 and kalibrierung_cm > 0:
+            return kalibrierung_pixel / kalibrierung_cm
+
         ref = LKW_REFERENZEN.get(self.referenz_typ)
         if not ref:
             raise ValueError(f"Unbekannter Referenz-Typ: {self.referenz_typ}")
@@ -156,16 +208,19 @@ class VolumeCalculator:
         if breite_cm <= 0:
             raise ValueError(f"Ungueltige Referenz-Breite: {breite_cm}")
 
+        # Methode 2: gemessene LKW-Breite in Pixeln
         if referenz_breite_px and referenz_breite_px > 0:
             return referenz_breite_px / breite_cm
-        else:
-            if img_width <= 0:
-                raise ValueError(f"Ungueltige Bildbreite: {img_width}")
-            estimated_breite_px = img_width * 0.80
-            return estimated_breite_px / breite_cm
+
+        # Methode 3: Fallback-Schaetzung (ungenau)
+        if img_width <= 0:
+            raise ValueError(f"Ungueltige Bildbreite: {img_width}")
+        estimated_breite_px = img_width * 0.80
+        return estimated_breite_px / breite_cm
 
     def berechne_aus_segmentierung(self, yolo_result, img_width, img_height,
-                                    referenz_breite_px=None, stamm_laenge_cm=None):
+                                    referenz_breite_px=None, stamm_laenge_cm=None,
+                                    kalibrierung_pixel=None, kalibrierung_cm=None):
         """
         Berechne Volumen aus YOLO Segmentierungsergebnis.
         Nutzt TimberVision-Klassen fuer praezisere Messung:
@@ -173,7 +228,10 @@ class VolumeCalculator:
         - side-Masken fuer Stammlaenge
         - trunk als Fallback
         """
-        px_cm = self.berechne_px_pro_cm(img_width, img_height, referenz_breite_px)
+        px_cm = self.berechne_px_pro_cm(
+            img_width, img_height, referenz_breite_px,
+            kalibrierung_pixel=kalibrierung_pixel, kalibrierung_cm=kalibrierung_cm,
+        )
         ref = LKW_REFERENZEN.get(self.referenz_typ, LKW_REFERENZEN['standard_lkw'])
         default_laenge = stamm_laenge_cm or ref['laenge_cm']
 
@@ -226,9 +284,12 @@ class VolumeCalculator:
         total_fm = 0
 
         if cut_detections:
-            # Beste Methode: Durchmesser aus Schnittflaechen
+            # Beste Methode: Durchmesser aus Schnittflaechen.
+            # Fuer Stammlaenge werden side-Detektionen bevorzugt, sonst trunk als Fallback
+            # (viele Modelle erkennen nur cut+trunk, kein side — trunk liefert dann die Laenge).
+            laengen_dets = side_detections if side_detections else trunk_detections
             staemme, total_fm = self._berechne_aus_cuts(
-                cut_detections, side_detections, px_cm, default_laenge,
+                cut_detections, laengen_dets, px_cm, default_laenge,
                 img_width, img_height
             )
         elif trunk_detections or side_detections:
@@ -243,12 +304,12 @@ class VolumeCalculator:
 
         return VolumenErgebnis(
             anzahl_staemme=len(staemme),
-            volumen_fm=round(total_fm, 2),
-            volumen_rm=round(total_rm, 2),
+            volumen_fm=round(float(total_fm), 2),
+            volumen_rm=round(float(total_rm), 2),
             holzart=self.holzart,
             umrechnungsfaktor=self.umrechnungsfaktor,
             referenz_typ=self.referenz_typ,
-            px_pro_cm=round(px_cm, 4),
+            px_pro_cm=round(float(px_cm), 4),
             konfidenz_gesamt=round(float(avg_conf), 3),
             staemme=[asdict(s) for s in staemme],
             klassen_info=klassen_counts,
@@ -269,7 +330,7 @@ class VolumeCalculator:
             quelle = "cut_bbox"
 
             if mask is not None:
-                ellipse_result = fit_ellipse_to_mask(mask, bbox)
+                ellipse_result = fit_ellipse_to_mask(mask, bbox, img_width, img_height)
                 if ellipse_result:
                     minor_px, major_px = ellipse_result
                     # Minor-Axis = Durchmesser (bei schraegemSchnitt)
@@ -300,11 +361,11 @@ class VolumeCalculator:
 
             stamm = StammErgebnis(
                 id=idx,
-                durchmesser_cm=round(durchmesser_cm, 1),
-                laenge_cm=round(laenge_cm, 1),
-                flaeche_cm2=round(flaeche_cm2, 1),
-                volumen_fm=round(volumen_fm, 4),
-                konfidenz=round(conf, 3),
+                durchmesser_cm=round(float(durchmesser_cm), 1),
+                laenge_cm=round(float(laenge_cm), 1),
+                flaeche_cm2=round(float(flaeche_cm2), 1),
+                volumen_fm=round(float(volumen_fm), 4),
+                konfidenz=round(float(conf), 3),
                 bbox=[float(b) for b in bbox / max(img_width, img_height)],
                 quelle=quelle,
             )
@@ -388,11 +449,11 @@ class VolumeCalculator:
 
             stamm = StammErgebnis(
                 id=idx,
-                durchmesser_cm=round(durchmesser_cm, 1),
-                laenge_cm=round(laenge_cm, 1),
-                flaeche_cm2=round(flaeche_cm2, 1),
-                volumen_fm=round(volumen_fm, 4),
-                konfidenz=round(conf, 3),
+                durchmesser_cm=round(float(durchmesser_cm), 1),
+                laenge_cm=round(float(laenge_cm), 1),
+                flaeche_cm2=round(float(flaeche_cm2), 1),
+                volumen_fm=round(float(volumen_fm), 4),
+                konfidenz=round(float(conf), 3),
                 bbox=[float(b) for b in bbox / max(img_width, img_height)],
                 quelle="bbox",
             )
@@ -460,7 +521,9 @@ class VolumeCalculator:
 def inference_and_calculate(image_path, model_path=None,
                             referenz_typ='standard_lkw',
                             holzart='fichte_rundholz',
-                            stamm_laenge_cm=None):
+                            stamm_laenge_cm=None,
+                            kalibrierung_pixel=None,
+                            kalibrierung_cm=None):
     """
     Convenience-Funktion: Bild → YOLO Inference → Volumen-Berechnung
     """
@@ -503,7 +566,10 @@ def inference_and_calculate(image_path, model_path=None,
 
     calc = VolumeCalculator(referenz_typ=referenz_typ, holzart=holzart)
     return calc.berechne_aus_segmentierung(
-        results[0], img_w, img_h, stamm_laenge_cm=stamm_laenge_cm
+        results[0], img_w, img_h,
+        stamm_laenge_cm=stamm_laenge_cm,
+        kalibrierung_pixel=kalibrierung_pixel,
+        kalibrierung_cm=kalibrierung_cm,
     )
 
 
